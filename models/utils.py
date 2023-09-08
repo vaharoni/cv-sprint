@@ -5,11 +5,13 @@ import shutil
 from tqdm.std import tqdm
 from collections import defaultdict
 import math
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 from torchvision.datasets import CIFAR100
 from torchvision.transforms import ToTensor
 from torch.utils.data import Subset
+import datasets
+
 
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
@@ -24,7 +26,8 @@ def train_model(
         val_dataloader: DataLoader,
         loss_fn: callable, 
         optimizer: torch.optim.Optimizer, 
-        num_epochs: int = 10,
+        epochs: int = 10,
+        last_epoch: int = 0,                                        # when continuing training, the last epoch the model trained on
         tensorboard_dir: str = '',
         patience: int = 0,                                          # 0 means early stop is inactive
         metrics: list[callable] = [],
@@ -34,7 +37,7 @@ def train_model(
     tb_writer = None
     if tensorboard_dir:
         tb_writer = SummaryWriter(tensorboard_dir)
-        if os.path.exists(tensorboard_dir):
+        if last_epoch == 0 and os.path.exists(tensorboard_dir):
             shutil.rmtree(tensorboard_dir)
 
     # Create a temporary directory to save training checkpoints
@@ -42,11 +45,16 @@ def train_model(
         best_model_params_path = os.path.join(tempdir, 'best_model_params.pt')
 
         torch.save(model.state_dict(), best_model_params_path)
-        best_loss = math.inf
-        best_loss_epoch = 0
+        if last_epoch == 0:
+            best_loss_epoch = 0
+            best_loss = math.inf
+        else:
+            best_loss_epoch = last_epoch - 1
+            best_loss = evaluate_model(model, val_dataloader, loss_fn)['loss']
+            print(f'Best loss: {best_loss:.4f}')
 
         try: 
-            for epoch in range(num_epochs):
+            for epoch in range(last_epoch, last_epoch + epochs):
                 running_metrics = { 'train': defaultdict(lambda: 0), 'val': defaultdict(lambda: 0) }
 
                 # Each epoch has a training and validation phase
@@ -89,7 +97,7 @@ def train_model(
                                 for metric_name in running_metrics[phase] }
 
                 # Print loss and metrics
-                print(f"Epoch {epoch + 1}/{num_epochs}: " + ", ".join([f"{metric_name}={mean_metrics[metric_name]:.4f}" for metric_name in mean_metrics]))
+                print(f"Epoch {epoch + 1}/{epochs}: " + ", ".join([f"{metric_name}={mean_metrics[metric_name]:.4f}" for metric_name in mean_metrics]))
 
                 if tb_writer is not None:
                     tb_metrics = defaultdict(lambda: dict())
@@ -98,12 +106,13 @@ def train_model(
                         metric_name = "_".join(metric_name)
                         tb_metrics[metric_name][phase] = mean_metrics[full_metric_name]
                     for metric_name in tb_metrics:
-                        tb_writer.add_scalars(metric_name, tb_metrics[metric_name], epoch)
+                        tb_writer.add_scalars(metric_name, tb_metrics[metric_name], epoch + 1)
 
                 # deep copy the model
                 if mean_metrics['val_loss'] < best_loss:
                     best_loss = mean_metrics['val_loss']
                     best_loss_epoch = epoch
+                    print(f"Saving params from epoch {epoch + 1}. Best loss: {best_loss:.4f}")
                     torch.save(model.state_dict(), best_model_params_path)
 
                 if patience > 0 and epoch - best_loss_epoch >= patience:
@@ -113,6 +122,7 @@ def train_model(
             pass
 
         # load best model weights
+        print(f"Loading model params from epoch {best_loss_epoch + 1}")
         model.load_state_dict(torch.load(best_model_params_path))
     return model
 
@@ -142,7 +152,8 @@ def evaluate_model(
         return mean_metrics
 
 
-def make_dataloaders(batch_size=32):
+# train_dl, valid_dl, test_dl, class_names
+def make_cifar_dataloaders(batch_size=64):
     train_set_full = CIFAR100(root='../data', train=True, transform=ToTensor(), download=True)
     test_set = CIFAR100(root='../data', train=False, transform=ToTensor(), download=True)
 
@@ -150,8 +161,57 @@ def make_dataloaders(batch_size=32):
     train_set = Subset(train_set_full, indices[:-5000])
     valid_set = Subset(train_set_full, indices[-5000:])
 
-    train_dl = DataLoader(train_set, shuffle=True, batch_size=batch_size, num_workers=2)
-    valid_dl = DataLoader(valid_set, shuffle=False, batch_size=batch_size, num_workers=2)
-    test_dl = DataLoader(test_set, shuffle=False, batch_size=batch_size, num_workers=2)
+    train_dl = DataLoader(train_set, shuffle=True, batch_size=batch_size, num_workers=4)
+    valid_dl = DataLoader(valid_set, shuffle=False, batch_size=batch_size, num_workers=4)
+    test_dl = DataLoader(test_set, shuffle=False, batch_size=batch_size, num_workers=4)
 
     return train_dl, valid_dl, test_dl, train_set_full.classes
+
+
+class TinyNetDataset(Dataset):
+    def __init__(self, origin):
+        self.origin = origin
+        self.converter = ToTensor()
+
+    def __getitem__(self, idx):
+        entry = self.origin[idx] 
+        label = entry['label']
+        img = entry['image']
+        img = img.convert('RGB')
+        img = self.converter(img)
+        return img, label
+    
+    def __len__(self):
+        return len(self.origin)
+
+TINY_IMAGE_NET_CLASSES = 200    
+TINY_IMAGE_NET_SAMPLES_PER_CLASS = 500
+
+def make_tiny_imagenet_dataloaders(batch_size=64, val_split=0.1):
+    origin_ds = datasets.load_dataset("zh-plus/tiny-imagenet")
+
+    train_set_full = TinyNetDataset(origin_ds['train'])
+    test_set = TinyNetDataset(origin_ds['valid'])
+
+    val_take_samples_n = math.floor(TINY_IMAGE_NET_SAMPLES_PER_CLASS * val_split)
+    train_indices = []
+    val_indices = []
+    for class_idx in range(TINY_IMAGE_NET_CLASSES):
+        class_indices = torch.arange(class_idx * TINY_IMAGE_NET_SAMPLES_PER_CLASS, (class_idx + 1) * TINY_IMAGE_NET_SAMPLES_PER_CLASS)
+        class_indices = class_indices[torch.randperm(TINY_IMAGE_NET_SAMPLES_PER_CLASS)].tolist()
+        train_indices += class_indices[val_take_samples_n:]
+        val_indices += class_indices[:val_take_samples_n]
+
+    train_set = Subset(train_set_full, train_indices)
+    valid_set = Subset(train_set_full, val_indices)    
+
+    train_dl = DataLoader(train_set, shuffle=True, batch_size=batch_size, num_workers=4)
+    valid_dl = DataLoader(valid_set, shuffle=False, batch_size=batch_size, num_workers=4)
+    test_dl = DataLoader(test_set, shuffle=False, batch_size=batch_size, num_workers=4)
+
+    return train_dl, valid_dl, test_dl
+
+    
+
+        
+
