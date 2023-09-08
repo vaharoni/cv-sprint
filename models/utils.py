@@ -154,4 +154,4 @@ def make_dataloaders(batch_size=32):
     valid_dl = DataLoader(valid_set, shuffle=False, batch_size=batch_size, num_workers=2)
     test_dl = DataLoader(test_set, shuffle=False, batch_size=batch_size, num_workers=2)
 
-    return train_dl, valid_dl, test_dl
+    return train_dl, valid_dl, test_dl, train_set_full.classes
