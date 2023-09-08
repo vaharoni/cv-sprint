@@ -1,6 +1,7 @@
 import torch
 from tempfile import TemporaryDirectory
 import os
+import shutil
 from tqdm.std import tqdm
 from collections import defaultdict
 import math
@@ -33,6 +34,8 @@ def train_model(
     tb_writer = None
     if tensorboard_dir:
         tb_writer = SummaryWriter(tensorboard_dir)
+        if os.path.exists(tensorboard_dir):
+            shutil.rmtree(tensorboard_dir)
 
     # Create a temporary directory to save training checkpoints
     with TemporaryDirectory() as tempdir:
@@ -89,7 +92,13 @@ def train_model(
                 print(f"Epoch {epoch + 1}/{num_epochs}: " + ", ".join([f"{metric_name}={mean_metrics[metric_name]:.4f}" for metric_name in mean_metrics]))
 
                 if tb_writer is not None:
-                    tb_writer.add_scalars('epoch', mean_metrics, epoch)
+                    tb_metrics = defaultdict(lambda: dict())
+                    for full_metric_name in mean_metrics:
+                        phase, *metric_name = full_metric_name.split('_')
+                        metric_name = "_".join(metric_name)
+                        tb_metrics[metric_name][phase] = mean_metrics[full_metric_name]
+                    for metric_name in tb_metrics:
+                        tb_writer.add_scalars(metric_name, tb_metrics[metric_name], epoch)
 
                 # deep copy the model
                 if mean_metrics['val_loss'] < best_loss:
@@ -114,7 +123,7 @@ def evaluate_model(
         metrics: list[callable] = [],
 ):
     model.eval()
-    running_metrics = defaultdict(0)
+    running_metrics = defaultdict(lambda: 0)
     with torch.no_grad():
         for inputs, y_true in dataloader:
             inputs: torch.Tensor = inputs.to(device)
@@ -127,7 +136,7 @@ def evaluate_model(
                 metric_name, metric_val = metric(y_pred, y_true)
                 running_metrics[metric_name] += metric_val
         
-        mean_metrics = { "metric_name": running_metrics[metric_name] / len(dataloader.dataset)
+        mean_metrics = { metric_name: running_metrics[metric_name] / len(dataloader.dataset)
                         for metric_name in running_metrics }
         
         return mean_metrics
