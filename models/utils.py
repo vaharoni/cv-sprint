@@ -35,6 +35,7 @@ def train_model(
 ):
     dataloaders = { 'train': train_dataloader, 'val': val_dataloader }
     tb_writer = None
+    history = defaultdict(lambda: [])
     if tensorboard_dir:
         tb_writer = SummaryWriter(tensorboard_dir)
         if last_epoch == 0 and os.path.exists(tensorboard_dir):
@@ -99,6 +100,12 @@ def train_model(
                 # Print loss and metrics
                 print(f"Epoch {epoch + 1}/{epochs}: " + ", ".join([f"{metric_name}={mean_metrics[metric_name]:.4f}" for metric_name in mean_metrics]))
 
+                # Store metrics in history
+                history['epoch'].append(epoch + 1)
+                for full_metric_name in mean_metrics:
+                    history[full_metric_name].append(mean_metrics[full_metric_name])
+
+                # Report to tensorboard
                 if tb_writer is not None:
                     tb_metrics = defaultdict(lambda: dict())
                     for full_metric_name in mean_metrics:
@@ -124,7 +131,7 @@ def train_model(
         # load best model weights
         print(f"Loading model params from epoch {best_loss_epoch + 1}")
         model.load_state_dict(torch.load(best_model_params_path))
-    return model
+    return history
 
 def evaluate_model(
         model: torch.nn.Module, 
