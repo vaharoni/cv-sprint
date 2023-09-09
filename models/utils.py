@@ -11,6 +11,7 @@ from torchvision.datasets import CIFAR100
 from torchvision.transforms import ToTensor
 from torch.utils.data import Subset
 import datasets
+import matplotlib.pyplot as plt
 
 
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
@@ -40,6 +41,7 @@ def train_model(
         tb_writer = SummaryWriter(tensorboard_dir)
         if last_epoch == 0 and os.path.exists(tensorboard_dir):
             shutil.rmtree(tensorboard_dir)
+            os.makedirs(tensorboard_dir, exist_ok=True)
 
     # Create a temporary directory to save training checkpoints
     with TemporaryDirectory() as tempdir:
@@ -49,6 +51,10 @@ def train_model(
         if last_epoch == 0:
             best_loss_epoch = 0
             best_loss = math.inf
+            if tb_writer is not None:
+                inputs, _ = next(iter(train_dataloader))
+                tb_writer.add_graph(model, inputs.to(device))
+                tb_writer.flush()
         else:
             best_loss_epoch = last_epoch - 1
             best_loss = evaluate_model(model, val_dataloader, loss_fn)['loss']
@@ -114,6 +120,7 @@ def train_model(
                         tb_metrics[metric_name][phase] = mean_metrics[full_metric_name]
                     for metric_name in tb_metrics:
                         tb_writer.add_scalars(metric_name, tb_metrics[metric_name], epoch + 1)
+                    tb_writer.flush()
 
                 # deep copy the model
                 if mean_metrics['val_loss'] < best_loss:
@@ -158,6 +165,28 @@ def evaluate_model(
         
         return mean_metrics
 
+
+def plot_metrics(hist):
+    x = hist['epoch']
+    y = defaultdict(lambda: {})
+    for metric_name in hist:
+        if metric_name == 'epoch':
+            continue
+        chart_name = "_".join(metric_name.split('_')[1:])
+        y[chart_name][metric_name] = hist[metric_name]
+    charts = len(y)
+    rows = math.ceil(charts / 2)
+    fig, axes = plt.subplots(rows, 2, figsize=(12, 3 * rows))
+    axes = axes.ravel()
+    for i, chart_name in enumerate(y):
+        ax: plt.Axes = axes[i]
+        ax.set_title(chart_name)
+        for metric_name in y[chart_name]:
+            ax.plot(x, hist[metric_name], label=metric_name)
+        ax.legend(loc='upper left')
+        ax.set_xticks(x)
+        ax.grid()
+    
 
 # train_dl, valid_dl, test_dl, class_names
 def make_cifar_dataloaders(batch_size=64):
