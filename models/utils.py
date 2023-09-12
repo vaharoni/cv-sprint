@@ -15,6 +15,7 @@ from torch.utils.data import Subset
 import datasets
 import matplotlib.pyplot as plt
 from pathlib import Path
+import pprint
 
 # = Usage
 
@@ -138,7 +139,21 @@ class ModelLifecycle:
         self.metrics = {}
 
     def __repr__(self):
-        return self.model.__repr__()
+        return pprint.pformat({
+            'model_name': self.model_name,
+            'description': self.description,
+            'persisted': self.persisted,
+            'compiled': self.compiled,
+            'optimizer_cls': self.optimizer.__class__,
+            'optimizer_args': self.optimizer_args,
+            'loss_fn_cls': self.loss_fn.__class__,
+            'loss_fn_args': self.loss_fn_args,
+            'scheduler_cls': self.scheduler.__class__,
+            'scheduler_args': self.scheduler_args,
+            'epoch': self.epoch,
+            'step': self.step,
+            'metrics': self.metrics
+        }, width=110, sort_dicts=False)
 
     def get_tensorboard_dir(self) -> Path:
         return get_tensorboard_dir(self.model_name)
@@ -146,12 +161,18 @@ class ModelLifecycle:
     def get_checkpoint_path(self) -> Path:
         return get_checkpoint_path(self.model_name)
 
-    # Only runs if the model is not compiled, i.e. before first training
+    # Only runs if the model is not compiled, i.e. before first training.
+    # The point is that when initializing a model like so:
+    #   my_model = utils.register_model(...)
+    #   my_model.setup(...)
+    #
+    # Then if the model is loaded from a checkpoint, in fact the checkpoing value will override the parameters sent to setup.
+    #
     def setup(self, *, optimizer_cls, loss_fn_cls, optimizer_args={}, loss_fn_args={}, scheduler_cls=None, scheduler_args={}):
         if not self.compiled:
             self.compile(optimizer_cls=optimizer_cls, 
                          loss_fn_cls=loss_fn_cls, 
-                         optimizier_args=optimizer_args,
+                         optimizer_args=optimizer_args,
                          loss_fn_args=loss_fn_args, 
                          scheduler_cls=scheduler_cls, 
                          scheduler_args=scheduler_args)
@@ -160,16 +181,17 @@ class ModelLifecycle:
             print('Skipped compilation')
         return self
 
+    # TODO: allow only to change the defaults rather than redefine everything
     # Forces changes to the entry regardless of model state
-    def compile(self, *, optimizer_cls, loss_fn_cls, optimizier_args={}, loss_fn_args={}, scheduler_cls=None, scheduler_args={}):    
-        optimizer = optimizer_cls(self.model.parameters(), **optimizier_args)
+    def compile(self, *, optimizer_cls, loss_fn_cls, optimizer_args={}, loss_fn_args={}, scheduler_cls=None, scheduler_args={}):    
+        optimizer = optimizer_cls(self.model.parameters(), **optimizer_args)
         loss_fn = loss_fn_cls(**loss_fn_args)
         scheduler = None
         if scheduler_cls:
             scheduler = scheduler_cls(optimizer, **scheduler_args)
 
         self.optimizer = optimizer
-        self.optimizer_args = optimizier_args
+        self.optimizer_args = optimizer_args
         self.loss_fn = loss_fn
         self.loss_fn_args = loss_fn_args
         self.scheduler = scheduler
@@ -213,7 +235,7 @@ class ModelLifecycle:
         self.persisted = True
 
         saved_str = f"Saved checkpoint for {self.model_name}. epoch={self.epoch}, step={self.step}."
-        metrics_str = ", ".join([f'{metric_name}={metric_val:4f}' for metric_name, metric_val in self.metrics.items()])
+        metrics_str = ", ".join([f'{metric_name}={metric_val:.4f}' for metric_name, metric_val in self.metrics.items()])
         print(" ".join([x for x in [saved_str, metrics_str] if x]))
         return True
 
@@ -254,9 +276,12 @@ class ModelLifecycle:
         self.persisted = True
         
         loaded_str = f"Loaded model {self.model_name} from checkpoint. epoch={self.epoch}, step={self.step}."
-        metrics_str = ", ".join([f'{metric_name}={metric_val:4f}' for metric_name, metric_val in self.metrics.items()])
+        metrics_str = ", ".join([f'{metric_name}={metric_val:.4f}' for metric_name, metric_val in self.metrics.items()])
         print(" ".join([x for x in [loaded_str, metrics_str] if x]))
-        return True        
+        return True      
+
+    def delete(self):
+        return delete_model(self.model_name)  
 
     def train(self, train_dataloader: DataLoader, val_dataloader: DataLoader, epochs: int = 10, patience: int = 0, metrics: list[callable] = []):
         if not self.compiled:
@@ -272,17 +297,14 @@ class ModelLifecycle:
         step_counter = self.step
         epoch_counter = self.epoch
 
-        if self.epoch == 0:
-            best_loss_epoch = 0
-            best_loss = math.inf
-            if tb_writer is not None:
-                inputs, _ = next(iter(train_dataloader))
-                tb_writer.add_graph(self.model, inputs.to(device))
-                tb_writer.flush()
-        else:
-            best_loss_epoch = self.epoch - 1
-            best_loss = self.evaluate(val_dataloader)['loss']
-            print(f'Best loss: {best_loss:.4f}')
+        best_loss_epoch = max(self.epoch - 1, 0)
+        best_loss = self.evaluate(val_dataloader)['loss']
+        print(f'Initial val_loss: {best_loss:.4f}')
+
+        if self.epoch == 0 and tb_writer is not None:
+            inputs, _ = next(iter(train_dataloader))
+            tb_writer.add_graph(self.model, inputs.to(device))
+            tb_writer.flush()
 
         try: 
             for epoch in range(epochs):
@@ -449,7 +471,8 @@ def make_cifar_dataloaders(batch_size=64):
     train_set_full = CIFAR100(root='../data', train=True, transform=transforms.ToTensor(), download=True)
     test_set = CIFAR100(root='../data', train=False, transform=transforms.ToTensor(), download=True)
 
-    indices = torch.randperm(len(train_set_full))
+    # indices = torch.randperm(len(train_set_full))
+    indices = torch.arange(len(train_set_full))
     train_set = Subset(train_set_full, indices[:-5000])
     valid_set = Subset(train_set_full, indices[-5000:])
 
@@ -491,6 +514,221 @@ class TinyNetDataset(Dataset):
 
 TINY_IMAGE_NET_CLASSES = 200    
 TINY_IMAGE_NET_SAMPLES_PER_CLASS = 500
+TINY_IMAGE_NET_CLASS_KEY = [
+    ('n01443537', 'goldfish, Carassius auratus'),
+    ('n01629819', 'European fire salamander, Salamandra salamandra'),
+    ('n01641577', 'bullfrog, Rana catesbeiana'),
+    ('n01644900',
+    'tailed frog, bell toad, ribbed toad, tailed toad, Ascaphus trui'),
+    ('n01698640', 'American alligator, Alligator mississipiensis'),
+    ('n01742172', 'boa constrictor, Constrictor constrictor'),
+    ('n01768244', 'trilobite'),
+    ('n01770393', 'scorpion'),
+    ('n01774384', 'black widow, Latrodectus mactans'),
+    ('n01774750', 'tarantula'),
+    ('n01784675', 'centipede'),
+    ('n01882714',
+    'koala, koala bear, kangaroo bear, native bear, Phascolarctos cinereus'),
+    ('n01910747', 'jellyfish'),
+    ('n01917289', 'brain coral'),
+    ('n01944390', 'snail'),
+    ('n01950731', 'sea slug, nudibranch'),
+    ('n01983481',
+    'American lobster, Northern lobster, Maine lobster, Homarus americanus'),
+    ('n01984695',
+    'spiny lobster, langouste, rock lobster, crawfish, crayfish, sea crawfish'),
+    ('n02002724', 'black stork, Ciconia nigra'),
+    ('n02056570', 'king penguin, Aptenodytes patagonica'),
+    ('n02058221', 'albatross, mollymawk'),
+    ('n02074367', 'dugong, Dugong dugon'),
+    ('n02094433', 'Yorkshire terrier'),
+    ('n02099601', 'golden retriever'),
+    ('n02099712', 'Labrador retriever'),
+    ('n02106662',
+    'German shepherd, German shepherd dog, German police dog, alsatian'),
+    ('n02113799', 'standard poodle'),
+    ('n02123045', 'tabby, tabby cat'),
+    ('n02123394', 'Persian cat'),
+    ('n02124075', 'Egyptian cat'),
+    ('n02125311',
+    'cougar, puma, catamount, mountain lion, painter, panther, Felis concolor'),
+    ('n02129165', 'lion, king of beasts, Panthera leo'),
+    ('n02132136', 'brown bear, bruin, Ursus arctos'),
+    ('n02165456', 'ladybug, ladybeetle, lady beetle, ladybird, ladybird beetle'),
+    ('n02226429', 'grasshopper, hopper'),
+    ('n02231487', 'walking stick, walkingstick, stick insect'),
+    ('n02233338', 'cockroach, roach'),
+    ('n02236044', 'mantis, mantid'),
+    ('n02268443',
+    "dragonfly, darning needle, devil's darning needle, sewing needle, snake feeder, snake doctor, mosquito hawk, skeeter hawk"),
+    ('n02279972',
+    'monarch, monarch butterfly, milkweed butterfly, Danaus plexippus'),
+    ('n02281406', 'sulphur butterfly, sulfur butterfly'),
+    ('n02321529', 'sea cucumber, holothurian'),
+    ('n02364673', 'guinea pig, Cavia cobaya'),
+    ('n02395406', 'hog, pig, grunter, squealer, Sus scrofa'),
+    ('n02403003', 'ox'),
+    ('n02410509', 'bison'),
+    ('n02415577',
+    'bighorn, bighorn sheep, cimarron, Rocky Mountain bighorn, Rocky Mountain sheep, Ovis canadensis'),
+    ('n02423022', 'gazelle'),
+    ('n02437312', 'Arabian camel, dromedary, Camelus dromedarius'),
+    ('n02480495', 'orangutan, orang, orangutang, Pongo pygmaeus'),
+    ('n02481823', 'chimpanzee, chimp, Pan troglodytes'),
+    ('n02486410', 'baboon'),
+    ('n02504458', 'African elephant, Loxodonta africana'),
+    ('n02509815',
+    'lesser panda, red panda, panda, bear cat, cat bear, Ailurus fulgens'),
+    ('n02666347', 'abacus'),
+    ('n02669723', "academic gown, academic robe, judge's robe"),
+    ('n02699494', 'altar'),
+    ('n02769748', 'backpack, back pack, knapsack, packsack, rucksack, haversack'),
+    ('n02788148', 'bannister, banister, balustrade, balusters, handrail'),
+    ('n02791270', 'barbershop'),
+    ('n02793495', 'barn'),
+    ('n02795169', 'barrel, cask'),
+    ('n02802426', 'basketball'),
+    ('n02808440', 'bathtub, bathing tub, bath, tub'),
+    ('n02814533',
+    'beach wagon, station wagon, wagon, estate car, beach waggon, station waggon, waggon'),
+    ('n02814860', 'beacon, lighthouse, beacon light, pharos'),
+    ('n02815834', 'beaker'),
+    ('n02823428', 'beer bottle'),
+    ('n02837789', 'bikini, two-piece'),
+    ('n02841315', 'binoculars, field glasses, opera glasses'),
+    ('n02843684', 'birdhouse'),
+    ('n02883205', 'bow tie, bow-tie, bowtie'),
+    ('n02892201', 'brass, memorial tablet, plaque'),
+    ('n02909870', 'bucket, pail'),
+    ('n02917067', 'bullet train, bullet'),
+    ('n02927161', 'butcher shop, meat market'),
+    ('n02948072', 'candle, taper, wax light'),
+    ('n02950826', 'cannon'),
+    ('n02963159', 'cardigan'),
+    ('n02977058',
+    'cash machine, cash dispenser, automated teller machine, automatic teller machine, automated teller, automatic teller, ATM'),
+    ('n02988304', 'CD player'),
+    ('n03014705', 'chest'),
+    ('n03026506', 'Christmas stocking'),
+    ('n03042490', 'cliff dwelling'),
+    ('n03085013', 'computer keyboard, keypad'),
+    ('n03089624', 'confectionery, confectionary, candy store'),
+    ('n03100240', 'convertible'),
+    ('n03126707', 'crane'),
+    ('n03160309', 'dam, dike, dyke'),
+    ('n03179701', 'desk'),
+    ('n03201208', 'dining table, board'),
+    ('n03255030', 'dumbbell'),
+    ('n03355925', 'flagpole, flagstaff'),
+    ('n03373237', 'fly'),
+    ('n03388043', 'fountain'),
+    ('n03393912', 'freight car'),
+    ('n03400231', 'frying pan, frypan, skillet'),
+    ('n03404251', 'fur coat'),
+    ('n03424325', 'gasmask, respirator, gas helmet'),
+    ('n03444034', 'go-kart'),
+    ('n03447447', 'gondola'),
+    ('n03544143', 'hourglass'),
+    ('n03584254', 'iPod'),
+    ('n03599486', 'jinrikisha, ricksha, rickshaw'),
+    ('n03617480', 'kimono'),
+    ('n03637318', 'lampshade, lamp shade'),
+    ('n03649909', 'lawn mower, mower'),
+    ('n03662601', 'lifeboat'),
+    ('n03670208', 'limousine, limo'),
+    ('n03706229', 'magnetic compass'),
+    ('n03733131', 'maypole'),
+    ('n03763968', 'military uniform'),
+    ('n03770439', 'miniskirt, mini'),
+    ('n03796401', 'moving van'),
+    ('n03814639', 'neck brace'),
+    ('n03837869', 'obelisk'),
+    ('n03838899', 'oboe, hautboy, hautbois'),
+    ('n03854065', 'organ, pipe organ'),
+    ('n03891332', 'parking meter'),
+    ('n03902125', 'pay-phone, pay-station'),
+    ('n03930313', 'picket fence, paling'),
+    ('n03937543', 'pill bottle'),
+    ('n03970156', "plunger, plumber's helper"),
+    ('n03977966',
+    'police van, police wagon, paddy wagon, patrol wagon, wagon, black Maria'),
+    ('n03980874', 'poncho'),
+    ('n03983396', 'pop bottle, soda bottle'),
+    ('n03992509', "potter's wheel"),
+    ('n04008634', 'projectile, missile'),
+    ('n04023962', 'punching bag, punch bag, punching ball, punchball'),
+    ('n04070727', 'refrigerator, icebox'),
+    ('n04074963', 'remote control, remote'),
+    ('n04099969', 'rocking chair, rocker'),
+    ('n04118538', 'rugby ball'),
+    ('n04133789', 'sandal'),
+    ('n04146614', 'school bus'),
+    ('n04149813', 'scoreboard'),
+    ('n04179913', 'sewing machine'),
+    ('n04251144', 'snorkel'),
+    ('n04254777', 'sock'),
+    ('n04259630', 'sombrero'),
+    ('n04265275', 'space heater'),
+    ('n04275548', "spider web, spider's web"),
+    ('n04285008', 'sports car, sport car'),
+    ('n04311004', 'steel arch bridge'),
+    ('n04328186', 'stopwatch, stop watch'),
+    ('n04356056', 'sunglasses, dark glasses, shades'),
+    ('n04366367', 'suspension bridge'),
+    ('n04371430', 'swimming trunks, bathing trunks'),
+    ('n04376876', 'syringe'),
+    ('n04398044', 'teapot'),
+    ('n04399382', 'teddy, teddy bear'),
+    ('n04417672', 'thatch, thatched roof'),
+    ('n04456115', 'torch'),
+    ('n04465666', 'tractor'),
+    ('n04486054', 'triumphal arch'),
+    ('n04487081', 'trolleybus, trolley coach, trackless trolley'),
+    ('n04501370', 'turnstile'),
+    ('n04507155', 'umbrella'),
+    ('n04532106', 'vestment'),
+    ('n04532670', 'viaduct'),
+    ('n04540053', 'volleyball'),
+    ('n04560804', 'water jug'),
+    ('n04562935', 'water tower'),
+    ('n04596742', 'wok'),
+    ('n04598010', 'wooden spoon'),
+    ('n06596364', 'comic book'),
+    ('n07056680', 'reel'),
+    ('n07583066', 'guacamole'),
+    ('n07614500', 'ice cream, icecream'),
+    ('n07615774', 'ice lolly, lolly, lollipop, popsicle'),
+    ('n07646821', 'goose'),
+    ('n07647870', 'drumstick'),
+    ('n07657664', 'plate'),
+    ('n07695742', 'pretzel'),
+    ('n07711569', 'mashed potato'),
+    ('n07715103', 'cauliflower'),
+    ('n07720875', 'bell pepper'),
+    ('n07749582', 'lemon'),
+    ('n07753592', 'banana'),
+    ('n07768694', 'pomegranate'),
+    ('n07871810', 'meat loaf, meatloaf'),
+    ('n07873807', 'pizza, pizza pie'),
+    ('n07875152', 'potpie'),
+    ('n07920052', 'espresso'),
+    ('n07975909', 'bee'),
+    ('n08496334', 'apron'),
+    ('n08620881', 'pole'),
+    ('n08742578', 'Chihuahua'),
+    ('n09193705', 'alp'),
+    ('n09246464', 'cliff, drop, drop-off'),
+    ('n09256479', 'coral reef'),
+    ('n09332890', 'lakeside, lakeshore'),
+    ('n09428293', 'seashore, coast, seacoast, sea-coast'),
+    ('n12267677', 'acorn'),
+    ('n12520864', 'broom'),
+    ('n13001041', 'mushroom'),
+    ('n13652335', 'nail'),
+    ('n13652994', 'chain'),
+    ('n13719102', 'slug'),
+    ('n14991210', 'orange')
+ ]
 
 def make_tiny_imagenet_dataloaders(batch_size=64, val_split=0.1, train_split=None, normalize=False, augment=False):
     if not train_split:
@@ -506,8 +744,8 @@ def make_tiny_imagenet_dataloaders(batch_size=64, val_split=0.1, train_split=Non
     train_indices = []
     val_indices = []
     for class_idx in range(TINY_IMAGE_NET_CLASSES):
-        class_indices = torch.arange(class_idx * TINY_IMAGE_NET_SAMPLES_PER_CLASS, (class_idx + 1) * TINY_IMAGE_NET_SAMPLES_PER_CLASS)
-        class_indices = class_indices[torch.randperm(TINY_IMAGE_NET_SAMPLES_PER_CLASS)].tolist()
+        class_indices = torch.arange(class_idx * TINY_IMAGE_NET_SAMPLES_PER_CLASS, (class_idx + 1) * TINY_IMAGE_NET_SAMPLES_PER_CLASS).tolist()
+        # class_indices = class_indices[torch.randperm(TINY_IMAGE_NET_SAMPLES_PER_CLASS)].tolist()
         train_indices += class_indices[val_take_samples_n:val_take_samples_n+train_take_samples_n]
         val_indices += class_indices[:val_take_samples_n]
 
@@ -521,4 +759,5 @@ def make_tiny_imagenet_dataloaders(batch_size=64, val_split=0.1, train_split=Non
     valid_dl = DataLoader(valid_set, shuffle=False, batch_size=batch_size, num_workers=4)
     test_dl = DataLoader(test_set, shuffle=False, batch_size=batch_size, num_workers=4)
 
-    return train_dl, valid_dl, test_dl
+    return train_dl, valid_dl, test_dl, TINY_IMAGE_NET_CLASS_KEY
+
