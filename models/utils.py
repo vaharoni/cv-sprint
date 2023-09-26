@@ -16,6 +16,7 @@ import datasets
 import matplotlib.pyplot as plt
 from pathlib import Path
 import pprint
+from copy import deepcopy
 
 # = Usage
 
@@ -64,7 +65,7 @@ def register_model(name, model, description=None):
         obj.load_checkpoint()
         print(f'{name} registered.')
     else:
-        print(f'{name} loaded from memory.')
+        print(f'{name} fetched from memory.')
     obj.print_params(full=False)
     return obj
 
@@ -243,6 +244,7 @@ class ModelLifecycle:
         _ensure_namespace()
         load_path = self.get_checkpoint_path()
         if not load_path.exists():
+            print('Skipping load: checkpoint file does not exist')
             return False
         
         checkpoint = torch.load(load_path)
@@ -283,7 +285,7 @@ class ModelLifecycle:
     def delete(self):
         return delete_model(self.model_name)  
 
-    def train(self, train_dataloader: DataLoader, val_dataloader: DataLoader, epochs: int = 10, patience: int = 0, metrics: list[callable] = []):
+    def train(self, train_dataloader: DataLoader, val_dataloader: DataLoader, epochs: int = 10, patience: int = 0, warmup: int = 1, metrics: list[callable] = []):
         if not self.compiled:
             raise Exception(f'model {self.model_name} was not compiled. Call setup() or compile()')
 
@@ -305,6 +307,10 @@ class ModelLifecycle:
             inputs, _ = next(iter(train_dataloader))
             tb_writer.add_graph(self.model, inputs.to(device))
             tb_writer.flush()
+
+        warmup_scheduler = None
+        if warmup > 0 and warmup > epoch_counter:
+            warmup_scheduler = torch.optim.lr_scheduler.LinearLR(self.optimizer, start_factor=1e-3, total_iters=len(train_dataloader) * warmup)
 
         try: 
             for epoch in range(epochs):
@@ -335,6 +341,8 @@ class ModelLifecycle:
                             if phase == 'train':
                                 loss.backward()
                                 self.optimizer.step()
+                                if warmup_scheduler and warmup > epoch_counter:
+                                    warmup_scheduler.step()
 
                         # statistics
                         running_metrics[phase]['loss'] += loss.item() * inputs.shape[0]
@@ -345,7 +353,7 @@ class ModelLifecycle:
                         if phase == 'train':
                             step_counter += 1
 
-                    if phase == 'train' and self.scheduler is not None:
+                    if phase == 'train' and self.scheduler is not None and warmup <= epoch_counter:
                         self.scheduler.step()
 
                 epoch_counter += 1
@@ -376,10 +384,10 @@ class ModelLifecycle:
                 # deep copy the model
                 if mean_metrics['val_loss'] < best_loss:
                     best_loss = mean_metrics['val_loss']
-                    best_loss_epoch = epoch
+                    best_loss_epoch = epoch_counter
                     self.save_checkpoint(epoch=epoch_counter, step=step_counter, metrics=mean_metrics)
 
-                if patience > 0 and epoch - best_loss_epoch >= patience:
+                if patience > 0 and epoch_counter - best_loss_epoch >= patience:
                     raise EarlyStopException
                 
         except EarlyStopException:
@@ -464,23 +472,122 @@ class ModelLifecycle:
         else:
             print(f"Trainable params: {human_fn(trainable)}. Untrainable params: {human_fn(untrainable)}. Buffers: {human_fn(buffers)}.")
 
+class CompareModelWeights():
+    def __init__(self):
+        self.combined_stats = defaultdict(lambda: [])
+
+    def record(self, model):
+        state_dict = deepcopy(model.state_dict())    
+        for key in state_dict.keys():
+            *layer_name, param_name = key.split('.')
+            layer_name = '.'.join(layer_name)
+            self.combined_stats[(layer_name, param_name)].append(state_dict[key])
+
+    def get_agg_stats(self):
+        stats = defaultdict(lambda: [])
+        for (layer_name, param_name), param_arr in self.combined_stats.items():
+            for param in param_arr:
+                if param.dim() == 0:
+                    stats[(layer_name, param_name)].append(param.item())
+                else:
+                    stats[(layer_name, param_name)].append((round(param.mean().item(), 4), round(param.std().item(), 4)))
+        return stats
+        
+    def print_diff(self):
+        agg_stats = self.get_agg_stats()
+        longest_layer_name = max([len(x[0]) for x in agg_stats.keys()])
+        longest_param_name = max([len(x[1]) for x in agg_stats.keys()])
+        for key, value_arr in agg_stats.items():
+            if len(set(value_arr)) > 1:
+                print(f"{key[0]:{longest_layer_name}}   ", f"{key[1]:{longest_param_name}}   ", *[f"{str(x):20}" for x in value_arr])
+
 # = Data loaders
+
+# Per channel, for normalization calculations. This should be called after ToTensor().
+def calc_image_mean_and_std(dataloader):
+    channels_sum, channels_squared_sum, num_pixels = 0, 0, 0
+
+    for data, _ in dataloader:
+        channels_sum += torch.sum(data, dim=[0,2,3])
+        channels_squared_sum += torch.sum(data**2, dim=[0,2,3])
+        num_pixels += data.size(0) * data.size(2) * data.size(3)
+
+    mean = channels_sum / num_pixels
+    std = (channels_squared_sum/num_pixels - mean**2)**0.5
+
+    return mean, std
 
 # train_dl, valid_dl, test_dl, class_names
 def make_cifar_dataloaders(batch_size=64):
-    train_set_full = CIFAR100(root='../data', train=True, transform=transforms.ToTensor(), download=True)
-    test_set = CIFAR100(root='../data', train=False, transform=transforms.ToTensor(), download=True)
+    # Mine
+    # train_transforms = transforms.Compose([
+    #     transforms.RandomHorizontalFlip(),
+    #     transforms.RandomRotation(10),
+    #     transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
+    #     transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
+    #     transforms.ToTensor(),
+    #     transforms.Normalize((0.5072, 0.4866, 0.4410), (0.2673, 0.2564, 0.2760)),
+    # ])
+
+    # pytorch-CIFAR100
+    train_transforms = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(15),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5072, 0.4866, 0.4410), (0.2673, 0.2564, 0.2760))        
+    ])
+
+    valid_test_transforms = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5072, 0.4866, 0.4410), (0.2673, 0.2564, 0.2760)),
+    ])
+
+    train_set_full = CIFAR100(root='../data', train=True, download=True)
+    test_set = CIFAR100(root='../data', train=False, transform=valid_test_transforms, download=True)
 
     # indices = torch.randperm(len(train_set_full))
     indices = torch.arange(len(train_set_full))
-    train_set = Subset(train_set_full, indices[:-5000])
-    valid_set = Subset(train_set_full, indices[-5000:])
+    train_indices = indices[:-5000]
+    valid_indices = indices[-5000:]
+
+    train_set = Subset(train_set_full, train_indices)
+    train_set = [(train_transforms(img), label) for img, label in train_set]
+
+    valid_set = Subset(train_set_full, valid_indices)
+    valid_set = [(valid_test_transforms(img), label) for img, label in valid_set]
 
     train_dl = DataLoader(train_set, shuffle=True, batch_size=batch_size, num_workers=4)
     valid_dl = DataLoader(valid_set, shuffle=False, batch_size=batch_size, num_workers=4)
     test_dl = DataLoader(test_set, shuffle=False, batch_size=batch_size, num_workers=4)
 
     return train_dl, valid_dl, test_dl, train_set_full.classes
+
+
+def make_cifar_dataloaders_without_validation(batch_size=64):
+    train_transforms = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(15),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5072, 0.4866, 0.4410), (0.2673, 0.2564, 0.2760))        
+    ])
+
+    test_transforms = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5072, 0.4866, 0.4410), (0.2673, 0.2564, 0.2760))
+    ])
+
+    train_set = CIFAR100(root='../data', train=True, transform=train_transforms, download=True)
+    test_set = CIFAR100(root='../data', train=False, transform=test_transforms, download=True)
+
+    train_dl = DataLoader(train_set, shuffle=True, batch_size=batch_size, num_workers=4)
+    test_dl = DataLoader(test_set, shuffle=False, batch_size=batch_size, num_workers=4)
+
+    return train_dl, test_dl, train_set.classes
+
+
+# transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
 class TinyNetDataset(Dataset):
     def __init__(self, origin, normalize=False, augment=False):
@@ -497,7 +604,6 @@ class TinyNetDataset(Dataset):
         if normalize:
             transformations.append(
                 transforms.Normalize(mean=[0.4804, 0.4482, 0.3977], std=[0.2764, 0.2688, 0.2816])
-                # transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
             )
         self.converter = transforms.Compose(transformations)
 
@@ -514,6 +620,37 @@ class TinyNetDataset(Dataset):
 
 TINY_IMAGE_NET_CLASSES = 200    
 TINY_IMAGE_NET_SAMPLES_PER_CLASS = 500
+
+def make_tiny_imagenet_dataloaders(batch_size=64, val_split=0.1, train_split=None, normalize=False, augment=False):
+    if not train_split:
+        train_split = 1 - val_split
+
+    if val_split + train_split > 1:
+        val_split /= val_split + train_split
+        train_split /= val_split + train_split
+
+    val_take_samples_n = math.floor(TINY_IMAGE_NET_SAMPLES_PER_CLASS * val_split)
+    train_take_samples_n = math.floor(TINY_IMAGE_NET_SAMPLES_PER_CLASS * train_split)
+
+    train_indices = []
+    val_indices = []
+    for class_idx in range(TINY_IMAGE_NET_CLASSES):
+        class_indices = torch.arange(class_idx * TINY_IMAGE_NET_SAMPLES_PER_CLASS, (class_idx + 1) * TINY_IMAGE_NET_SAMPLES_PER_CLASS).tolist()
+        train_indices += class_indices[val_take_samples_n:val_take_samples_n+train_take_samples_n]
+        val_indices += class_indices[:val_take_samples_n]
+
+    origin_ds = datasets.load_dataset("zh-plus/tiny-imagenet")
+
+    train_set = TinyNetDataset(Subset(origin_ds['train'], train_indices), normalize=normalize, augment=augment)
+    valid_set = TinyNetDataset(Subset(origin_ds['train'], val_indices), normalize=normalize)
+    test_set = TinyNetDataset(origin_ds['valid'], normalize=normalize)
+
+    train_dl = DataLoader(train_set, shuffle=True, batch_size=batch_size, num_workers=4)
+    valid_dl = DataLoader(valid_set, shuffle=False, batch_size=batch_size, num_workers=4)
+    test_dl = DataLoader(test_set, shuffle=False, batch_size=batch_size, num_workers=4)
+
+    return train_dl, valid_dl, test_dl, TINY_IMAGE_NET_CLASS_KEY
+
 TINY_IMAGE_NET_CLASS_KEY = [
     ('n01443537', 'goldfish, Carassius auratus'),
     ('n01629819', 'European fire salamander, Salamandra salamandra'),
@@ -729,35 +866,3 @@ TINY_IMAGE_NET_CLASS_KEY = [
     ('n13719102', 'slug'),
     ('n14991210', 'orange')
  ]
-
-def make_tiny_imagenet_dataloaders(batch_size=64, val_split=0.1, train_split=None, normalize=False, augment=False):
-    if not train_split:
-        train_split = 1 - val_split
-
-    if val_split + train_split > 1:
-        val_split /= val_split + train_split
-        train_split /= val_split + train_split
-
-    val_take_samples_n = math.floor(TINY_IMAGE_NET_SAMPLES_PER_CLASS * val_split)
-    train_take_samples_n = math.floor(TINY_IMAGE_NET_SAMPLES_PER_CLASS * train_split)
-
-    train_indices = []
-    val_indices = []
-    for class_idx in range(TINY_IMAGE_NET_CLASSES):
-        class_indices = torch.arange(class_idx * TINY_IMAGE_NET_SAMPLES_PER_CLASS, (class_idx + 1) * TINY_IMAGE_NET_SAMPLES_PER_CLASS).tolist()
-        # class_indices = class_indices[torch.randperm(TINY_IMAGE_NET_SAMPLES_PER_CLASS)].tolist()
-        train_indices += class_indices[val_take_samples_n:val_take_samples_n+train_take_samples_n]
-        val_indices += class_indices[:val_take_samples_n]
-
-    origin_ds = datasets.load_dataset("zh-plus/tiny-imagenet")
-
-    train_set = TinyNetDataset(Subset(origin_ds['train'], train_indices), normalize=normalize, augment=augment)
-    valid_set = TinyNetDataset(Subset(origin_ds['train'], val_indices), normalize=normalize)
-    test_set = TinyNetDataset(origin_ds['valid'], normalize=normalize)
-
-    train_dl = DataLoader(train_set, shuffle=True, batch_size=batch_size, num_workers=4)
-    valid_dl = DataLoader(valid_set, shuffle=False, batch_size=batch_size, num_workers=4)
-    test_dl = DataLoader(test_set, shuffle=False, batch_size=batch_size, num_workers=4)
-
-    return train_dl, valid_dl, test_dl, TINY_IMAGE_NET_CLASS_KEY
-
