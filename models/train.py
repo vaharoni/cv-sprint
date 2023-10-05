@@ -267,6 +267,8 @@ class Model:
         self.step_scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
         self.step = 0
         self.epoch = 0
+        self.last_checkpoint = None
+        self.print_params(False)
 
     def tensorboard_path(self) -> Path:
         return root_folder / 'runs' / noetbook_namespace / self.id
@@ -335,15 +337,17 @@ class Model:
     @contextmanager
     def checkpoint(self, id, description=None):
         cp = CheckpointLifecycle(model=self, id=id, description=description)
+        self.last_checkpoint = cp
         yield cp.api
 
     def load_checkpoint(self, id, from_backup=False):
         cp = CheckpointLifecycle(model=self, id=id)
+        self.last_checkpoint = cp
         cp.load(backup=from_backup)
         return self
 
     def delete_checkpoint(self, id):
-        cp = CheckpointLifecycle(model=self, id=id)
+        cp = self.last_checkpoint if self.last_checkpoint and self.last_checkpoint.id == id else CheckpointLifecycle(model=self, id=id)
         cp.delete()
 
     def delete(self):
@@ -536,6 +540,7 @@ class CheckpointLifecycle:
         self.description = description
         self.persisted = False
         self.metrics = {}
+        self.histories = []
         self.api = CheckpointAPI(self)
 
     def serialize(self):
@@ -605,14 +610,32 @@ class CheckpointLifecycle:
     def load_history(self):
         hist_path = self.hist_path()
         if not hist_path.exists():
-            return []
-        return torch.load(hist_path)
+            return False
+        self.histories = torch.load(hist_path)
+        return True
 
-    def save_history(self, history):
+    def save_history(self):
         hist_path = self.hist_path()
         os.makedirs(hist_path.parent, exist_ok=True)
-        torch.save(dict(history), hist_path)
+        torch.save(self.histories, hist_path)
         return True
+    
+    def set_history(self, index, hist):
+        if index < len(self.histories):
+            self.histories[index] = dict(hist)
+        elif index == len(self.histories):
+            self.histories.append(dict(hist))
+        else:
+            raise Exception(f'Cannot set history of length {len(self.histories)} at index {index}')
+        
+    def combined_history(self):
+        padding = 0
+        hist_dict = defaultdict(lambda: [None] * padding)
+        for hist in self.histories:
+            for key, values in hist.items():
+                hist_dict[key] += values
+            padding += len(hist['epoch'])
+        return dict(hist_dict)
 
     def delete(self):
         backup_path = self.checkpoint_path(backup=True)
@@ -632,8 +655,8 @@ class CheckpointLifecycle:
     
 class CheckpointAPI:
     def __init__(self, cp_lifecycle: CheckpointLifecycle):
-        self._trained = False
         self._cp_lifecycle = cp_lifecycle
+        self._train_method_call_count = 0
 
     def setup(self, 
               loss_cls=None, 
@@ -679,23 +702,27 @@ class CheckpointAPI:
               patience: int = 0, 
               warmup: int = 1, 
               metrics: list[callable] = []):
-        if self._trained:
-            raise Exception('train() can only be called once within a checkpoint block')
-        self._trained = True
+        
+        if self._train_method_call_count == 0:
+            self._cp_lifecycle.load()
+            self._cp_lifecycle.load_history()
 
-        if self._cp_lifecycle.load():
-            hist = self._cp_lifecycle.load_history()
+        self._train_method_call_count += 1
+
+        if self._train_method_call_count <= len(self._cp_lifecycle.histories):
+            hist = self._cp_lifecycle.histories[self._train_method_call_count - 1]
             for msg in hist['log']:
                 print(msg)
             return hist
-        
+
         tensorboard_dir = self._cp_lifecycle.tensorboard_path()
 
         def save_checkpoint_fn(*args, **opts):
             self._cp_lifecycle.save(*args, **opts)
 
         def save_hist_fn(hist):
-            self._cp_lifecycle.save_history(hist)
+            self._cp_lifecycle.set_history(self._train_method_call_count - 1, hist)
+            self._cp_lifecycle.save_history()
 
         def load_best_fn(logger=None):
             self._cp_lifecycle.load(backup=False, logger=logger)
@@ -716,7 +743,8 @@ class CheckpointAPI:
     def evaluate(self, *args, **opts):
         return self._cp_lifecycle.model.evaluate(*args, **opts)
     
-    def plot_metrics(self, hist):
+    def plot_metrics(self, hist=None):
+        hist = hist if hist else self._cp_lifecycle.combined_history()
         plot_metrics(hist)
 
 def plot_metrics(hist):
