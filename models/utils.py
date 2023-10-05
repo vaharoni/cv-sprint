@@ -69,6 +69,31 @@ def register_model(name, model, description=None):
     obj.print_params(full=False)
     return obj
 
+def fork_model(original_name, original_model, new_name, description=None):
+    obj = _model_registry.get(new_name)
+    if obj:
+        print(f'{new_name} fetched from memory.')
+        return obj
+
+    elif get_checkpoint_path(new_name).exists():
+        obj = ModelLifecycle(model_name=new_name, model=original_model, description=description)
+        obj.load_checkpoint()
+        _model_registry[new_name] = obj
+        print(f'{new_name} registered.')
+        return obj
+
+    elif get_checkpoint_path(original_name).exists():
+        obj = ModelLifecycle(model_name=original_name, model=original_model)
+        obj.load_checkpoint()
+        obj._reset_attr(model_name=new_name, description=description)
+        _model_registry[new_name] = obj
+        print(f'{new_name} registered.')
+        return obj
+
+    else:
+        print(f'Cannot find checkpoint for model {original_name}. Was it saved?')
+        return
+
 def delete_model(name):
     found_anything = False
     obj = _model_registry.get(name)
@@ -124,10 +149,8 @@ def plot_metrics(hist):
 
 class ModelLifecycle:
     def __init__(self, model_name, model, description=None):
-        self.model_name = model_name
         self.model = model.to(device)
-        self.description = description
-        self.persisted = False
+        self._reset_attr(model_name, description)
         self.compiled = False
         self.optimizer = None
         self.optimizer_args = None
@@ -138,6 +161,11 @@ class ModelLifecycle:
         self.epoch = 0
         self.step = 0
         self.metrics = {}
+
+    def _reset_attr(self, model_name, description):
+        self.model_name = model_name
+        self.description = description
+        self.persisted = False
 
     def __repr__(self):
         return pprint.pformat({
@@ -280,11 +308,14 @@ class ModelLifecycle:
         loaded_str = f"Loaded model {self.model_name} from checkpoint. epoch={self.epoch}, step={self.step}."
         metrics_str = ", ".join([f'{metric_name}={metric_val:.4f}' for metric_name, metric_val in self.metrics.items()])
         print(" ".join([x for x in [loaded_str, metrics_str] if x]))
-        return True      
+        return True
+    
+    def fork(self, model_name, description=None):
+        return fork_model(original_name=self.model_name, original_model=self.model, new_name=model_name, description=description)
 
     def delete(self):
         return delete_model(self.model_name)  
-
+    
     def train(self, train_dataloader: DataLoader, val_dataloader: DataLoader, epochs: int = 10, patience: int = 0, warmup: int = 1, metrics: list[callable] = []):
         if not self.compiled:
             raise Exception(f'model {self.model_name} was not compiled. Call setup() or compile()')
@@ -501,7 +532,6 @@ class CompareModelWeights():
             if len(set(value_arr)) > 1:
                 print(f"{key[0]:{longest_layer_name}}   ", f"{key[1]:{longest_param_name}}   ", *[f"{str(x):20}" for x in value_arr])
 
-# = Data loaders
 
 # Per channel, for normalization calculations. This should be called after ToTensor().
 def calc_image_mean_and_std(dataloader):
@@ -516,6 +546,8 @@ def calc_image_mean_and_std(dataloader):
     std = (channels_squared_sum/num_pixels - mean**2)**0.5
 
     return mean, std
+
+# = Data loaders
 
 # train_dl, valid_dl, test_dl, class_names
 def make_cifar_dataloaders(batch_size=64):
