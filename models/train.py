@@ -101,7 +101,7 @@ from tempfile import TemporaryDirectory
 import os
 import shutil
 from tqdm.std import tqdm
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 import math
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
@@ -166,7 +166,78 @@ def metric_accuracy(y_pred, y_true):
 
 class EarlyStopException(Exception): pass
 
-# = Main class
+SetupLoss = namedtuple('SetupLoss', ['cls'])
+SetupComponent = namedtuple('SetupComponent', ['cls', 'args', 'fn'])
+
+class SetupManager():
+    """ When setup() is called inside checkpoint blocks, we want the appropriate setup component (e.g. optimizer, scheduler) 
+    to be built and overwritten on the model level. This includes the ability to partially override a component without affecting others - 
+    an important consideration given that we want the state of optimizers and schedulers to be maintained.  
+    When load_checkpoint() is called, we can rebuild the components from scratch, since the checkpoint file contains the appropriate 
+    post-training states.
+    """
+    def __init__(self, model: 'Model') -> None:
+        self.model = model
+        self.component_recipes = {
+            'loss': SetupLoss(None),
+            'optimizer': SetupComponent(None, None, None),
+            'epoch_scheduler': SetupComponent(None, None, None),
+            'step_scheduler': SetupComponent(None, None, None),
+        }
+
+    def __repr__(self):
+        return pprint.pformat(self.component_recipes, sort_dicts=False)
+
+    def setup_loss(self, loss_cls=None):
+        if loss_cls:
+            self.component_recipes['loss'] = SetupLoss(loss_cls)
+            self.build_loss()
+
+    def _set_component(self, key, cls=None, args=None, fn=None):
+        if cls or args or fn:
+            self.component_recipes[key] = SetupComponent(cls, args, fn)
+            return True
+        return False
+
+    def setup_optimizer(self, optimizer_cls=None, optimizer_args=None, optimizer_fn=None):
+        self._set_component('optimizer', optimizer_cls, optimizer_args, optimizer_fn) and self.build_optimizer()
+
+    def setup_epoch_scheduler(self, epoch_scheduler_cls=None, epoch_scheduler_args=None, epoch_scheduler_fn=None):
+        self._set_component('epoch_scheduler', epoch_scheduler_cls, epoch_scheduler_args, epoch_scheduler_fn) and self.build_scheduler('epoch_scheduler')
+
+    def setup_step_scheduler(self, step_scheduler_cls=None, step_scheduler_args=None, step_scheduler_fn=None):
+        self._set_component('step_scheduler', step_scheduler_cls, step_scheduler_args, step_scheduler_fn) and self.build_scheduler('step_scheduler')
+
+    def build_loss(self):
+        if self.component_recipes['loss'].cls:
+            self.model.loss_fn = self.component_recipes['loss'].cls()
+
+    def build_optimizer(self):
+        component = self.component_recipes['optimizer']
+        if component.fn:
+            self.model.optimizer = component.fn(self.model.model.parameters())
+        elif component.cls or component.args:
+            optimizer_args = component.args if component.args else dict()
+            self.model.optimizer = component.cls(self.model.model.parameters(), **optimizer_args)
+
+    def build_scheduler(self, key):
+        component = self.component_recipes[key]
+        if component.fn:
+            setattr(self.model, key, component.fn(self.model.optimizer))
+        elif component.cls or component.args:
+            scheduler_args = component.args if component.args else dict()
+            setattr(self.model, key, component.cls(self.model.optimizer, **scheduler_args))
+
+    def build_all(self):
+        self.build_loss()
+        self.build_optimizer()
+        self.build_scheduler('epoch_scheduler')
+        self.build_scheduler('step_scheduler')
+
+    def clone(self):
+        other = SetupManager(model=self.model)
+        other.component_recipes = deepcopy(self.component_recipes)
+        return other
 
 # This is built with the idea of a callback. The constructor can take anything, while the hooks take a sensible API.
 class MetricsManager:
@@ -253,21 +324,21 @@ class MetricsManager:
             self.best_watched_metric_epoch = self.global_epoch_start + local_epoch
             self.best_watched_metric = self.mean_metrics[f'val_{self.watch}']
 
-        
-
 class Model:
     def __init__(self, id, model: torch.nn.Module, description=None):
         _ensure_namespace()
         self.id = _ensure_no_space(id)
         self.description = description
         self.model = model.to(device)
+        self.setup_manager = SetupManager(model=self)
         self.optimizer: torch.optim.Optimizer | None = None
         self.loss_fn = None
         self.epoch_scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
         self.step_scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
         self.step = 0
         self.epoch = 0
-        self.last_checkpoint = None
+        self.checkpoints = {}
+        self.active_checkpoint = None
         self.print_params(False)
 
     def tensorboard_path(self) -> Path:
@@ -275,35 +346,35 @@ class Model:
     
     def checkpoint_path(self) -> Path:
         return root_folder / 'ckpts' / noetbook_namespace / self.id
-
-    def build_loss(self, loss_cls=None):
-        if loss_cls:
-            self.loss_fn = loss_cls()
-
-    def build_optimizer(self, optimizer_cls=None, optimizer_args=None, optimizer_fn=None):
-        if optimizer_fn:
-            self.optimizer = optimizer_fn(self.model.parameters())
-        elif optimizer_cls or optimizer_args:
-            optimizer_args = optimizer_args if optimizer_args else dict()
-            self.optimizer = optimizer_cls(self.model.parameters(), **optimizer_args)
-
-    def build_epoch_scheduler(self, epoch_scheduler_cls=None, epoch_scheduler_args=None, epoch_scheduler_fn=None):
-        if epoch_scheduler_fn:
-            self.epoch_scheduler = epoch_scheduler_fn(self.optimizer)
-        elif epoch_scheduler_cls or epoch_scheduler_args:
-            epoch_scheduler_args = epoch_scheduler_args if epoch_scheduler_args else dict()
-            self.epoch_scheduler = epoch_scheduler_cls(self.optimizer, **epoch_scheduler_args)
-
-    def build_step_scheduler(self, step_scheduler_cls=None, step_scheduler_args=None, step_scheduler_fn=None):
-        if step_scheduler_fn:
-            self.epoch_scheduler = step_scheduler_fn(self.optimizer)
-        elif  step_scheduler_cls or step_scheduler_args:
-            step_scheduler_args = step_scheduler_args if step_scheduler_args else dict()
-            self.epoch_scheduler = step_scheduler_cls(self.optimizer, **step_scheduler_args)
-
+    
+    def _obtain_checkpoint(self, id, description=None) -> 'CheckpointLifecycle':
+        cp = self.checkpoints.get(id)
+        if not cp:
+            cp = CheckpointLifecycle(model=self, id=id, description=description)
+            self.checkpoints[id] = cp
+        return cp
+    
+    def _remove_checkpoint(self, id):
+        cp = self._obtain_checkpoint(id)
+        if id in self.checkpoints:
+            del self.checkpoints[id]
+        if self.active_checkpoint and self.active_checkpoint.id == id:
+            self.active_checkpoint = None
+        return cp
+    
     def set_epoch_and_step(self, global_epoch, global_step):
         self.epoch = global_epoch
         self.step = global_step
+
+    def setup(self, 
+              loss_cls=None, 
+              optimizer_cls=None, optimizer_args=None, optimizer_fn=None, 
+              epoch_scheduler_cls=None, epoch_scheduler_args=None, epoch_scheduler_fn=None,
+              step_scheduler_cls=None, step_scheduler_args=None, step_scheduler_fn=None):
+        self.setup_manager.setup_loss(loss_cls)
+        self.setup_manager.setup_optimizer(optimizer_cls, optimizer_args, optimizer_fn)
+        self.setup_manager.setup_epoch_scheduler(epoch_scheduler_cls, epoch_scheduler_args, epoch_scheduler_fn)
+        self.setup_manager.setup_step_scheduler(step_scheduler_cls, step_scheduler_args, step_scheduler_fn)
 
     def serialize(self):
         data = {
@@ -336,23 +407,80 @@ class Model:
 
     @contextmanager
     def checkpoint(self, id, description=None):
-        cp = CheckpointLifecycle(model=self, id=id, description=description)
-        self.last_checkpoint = cp
-        yield cp.api
+        cp = self._obtain_checkpoint(id, description)
+        self.active_checkpoint = cp
+        yield cp.get_api()
 
     def load_checkpoint(self, id, from_backup=False):
-        cp = CheckpointLifecycle(model=self, id=id)
-        self.last_checkpoint = cp
-        cp.load(backup=from_backup)
-        return self
+        cp = self._obtain_checkpoint(id)
+        self.active_checkpoint = cp
+        self.setup_manager = cp.setup_manager_copy
+        self.setup_manager.build_all()
+        cp.load(backup=from_backup, logger=print)
+        cp.load_history()
 
     def delete_checkpoint(self, id):
-        cp = self.last_checkpoint if self.last_checkpoint and self.last_checkpoint.id == id else CheckpointLifecycle(model=self, id=id)
+        cp = self._remove_checkpoint(id)
         cp.delete()
 
     def delete(self):
         shutil.rmtree(self.tensorboard_path(), ignore_errors=True)
         shutil.rmtree(self.checkpoint_path(), ignore_errors=True)
+        self.checkpoints = {}
+        self.active_checkpoint = None        
+
+    def find_lr(self, dataloader, optimizer_cls=None, optimizer_args=None, loss_cls=None, epochs=1, min_rate=1e-8, max_rate=1):
+        """ Typical usage, which will clone the model's optimizer and its internal state:
+
+            res = model.find_lr(train_dl)
+            res.plot()
+        """
+        if loss_cls:
+            loss_fn = loss_cls()
+        elif self.loss_fn:
+            loss_fn = self.loss_fn
+        else:
+            raise Exception('The model does not have a loss function and none was provided')
+        
+        if optimizer_cls or optimizer_args:
+            optimizer_args = optimizer_args if optimizer_args else dict()
+            optimizer_args = {**optimizer_args, 'lr': min_rate}
+            optimizer: torch.optim.Optimizer = optimizer_cls(self.model.parameters(), **optimizer_args)
+        elif self.optimizer:
+            optimizer: torch.optim.Optimizer = self.optimizer.__class__(self.model.parameters())
+            optimizer.load_state_dict(self.optimizer.state_dict())
+            for param in optimizer.param_groups:
+                param['lr'] = min_rate
+        else:
+            raise Exception('The model does not have an optimizer and none was provided')
+        
+        if not self.active_checkpoint:
+            orig_state = deepcopy(self.model.state_dict())
+
+        iterations = len(dataloader) * epochs
+        gamma = (max_rate / min_rate) ** (1 / iterations)
+        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma)
+        self.model.train()
+        rates, losses = [], []
+        for _ in range(epochs):
+            for inputs, y_true in tqdm(dataloader):
+                inputs = inputs.to(device)
+                y_true = y_true.to(device)
+                optimizer.zero_grad()
+                y_pred = self.model(inputs)
+                loss: torch.Tensor = loss_fn(y_pred, y_true)
+                rates.append(optimizer.param_groups[0]['lr'])
+                losses.append(loss.item())
+                loss.backward()
+                optimizer.step()
+                scheduler.step()
+                
+        if self.active_checkpoint:
+            self.active_checkpoint.load()
+        else:
+            self.model.load_state_dict(orig_state)
+
+        return LearningRateVsLoss(rates, losses)
 
     def train(self, 
               train_dataloader: DataLoader, 
@@ -460,7 +588,14 @@ class Model:
         return metrics_manager.history
 
 
-    def evaluate(self, dataloader: DataLoader, metrics: list[callable] = []):
+    def evaluate(self, dataloader: DataLoader, loss_cls=None, metrics: list[callable] = []):
+        if loss_cls:
+            loss_fn = loss_cls()
+        elif self.loss_fn:
+            loss_fn = self.loss_fn
+        else:
+            raise Exception('The model does not have a loss function and none was provided')
+            
         self.model.eval()
         running_metrics = defaultdict(lambda: 0)
         with torch.no_grad():
@@ -469,7 +604,7 @@ class Model:
                 y_true: torch.Tensor = y_true.to(device)
 
                 y_pred = self.model(inputs)
-                loss = self.loss_fn(y_pred, y_true)
+                loss = loss_fn(y_pred, y_true)
                 running_metrics['loss'] += loss.item() * inputs.shape[0]
                 for metric in metrics:
                     metric_val = metric(y_pred, y_true)
@@ -536,17 +671,39 @@ class Model:
 class CheckpointLifecycle:
     def __init__(self, model: Model, id, description=None):
         self.model = model
-        self.id = str(id).zfill(4) if isinstance(id, int) else _ensure_no_space(id)
+        self.id = id
+        self.norm_id = str(id).zfill(4) if isinstance(id, int) else _ensure_no_space(id)
         self.description = description
         self.persisted = False
         self.metrics = {}
         self.histories = []
-        self.api = CheckpointAPI(self)
+        self.setup_manager_copy = model.setup_manager.clone()
+
+    def __repr__(self):
+        return pprint.pformat({
+            'model_id': self.model.id,
+            'model_description': self.model.description,
+            'checkpoint_id': self.id,
+            'checkpoint_norm_id': self.norm_id,
+            'checkpoint_description': self.description,
+            'persisted': self.persisted,
+            'metrics': self.metrics,
+            'train_count': len(self.histories),
+            'setup': self.setup_manager_copy
+        }, sort_dicts=False)
+
+    def get_api(self) -> 'CheckpointAPI':
+        return CheckpointAPI(self)
+    
+    def setup(self, *args, **opts):
+        self.model.setup(*args, **opts)
+        self.setup_manager_copy = self.model.setup_manager.clone()
 
     def serialize(self):
         data = {
             **self.model.serialize(),
             'checkpoint_id': self.id,
+            'checkpoint_norm_id': self.norm_id,
             'checkpoint_description': self.description,
             'checkpoint_metrics': self.metrics
         }
@@ -559,19 +716,27 @@ class CheckpointLifecycle:
         self.metrics = data['checkpoint_metrics']
 
     def tensorboard_path(self) -> Path:
-        return self.model.tensorboard_path() / self.id
+        return self.model.tensorboard_path() / self.norm_id
     
     def checkpoint_path(self, backup=False) -> Path:
         version = 'best' if backup else 'last'
-        return self.model.checkpoint_path() / f'{self.id + model_checkpoint_sep + version}.pt'
+        return self.model.checkpoint_path() / f'{self.norm_id + model_checkpoint_sep + version}.pt'
     
     def hist_path(self) -> Path:
-        return self.model.checkpoint_path() / f'{self.id}.hist'
+        return self.model.checkpoint_path() / f'{self.norm_id}.hist'
 
     # The knowledge of whether a backup exists is only present in the calling code. There is no trace for such information in the data stored.
     def load(self, backup=False, logger=None):
         path = self.checkpoint_path(backup=backup)
+
+        if backup and not path.exists():
+            if logger:
+                logger(f"Backup for model {self.model.id} checkpoint {self.id} does not exist. Trying from latest.")
+            path = self.checkpoint_path(backup=False)
+            
         if not path.exists(): 
+            if logger:
+                logger(f"Cannot find checkpoint {self.id} for model {self.model.id}")
             return False
 
         data = torch.load(path)
@@ -656,13 +821,10 @@ class CheckpointLifecycle:
 class CheckpointAPI:
     def __init__(self, cp_lifecycle: CheckpointLifecycle):
         self._cp_lifecycle = cp_lifecycle
+        self._setup_called = False
         self._train_method_call_count = 0
 
-    def setup(self, 
-              loss_cls=None, 
-              optimizer_cls=None, optimizer_args=None, optimizer_fn=None, 
-              epoch_scheduler_cls=None, epoch_scheduler_args=None, epoch_scheduler_fn=None,
-              step_scheduler_cls=None, step_scheduler_args=None, step_scheduler_fn=None):
+    def setup(self, *args, **opts):
         """args:
             Loss factory:
                 loss_cls=torch.nn.CrossEntropyLoss,
@@ -688,12 +850,11 @@ class CheckpointAPI:
             Step scheduler, option 2:
                 step_scheduler_fn=lambda optimizer: torch.optim.lr_scheduler.StepLR(optimizer, step_size=40, gamma=0.2)
         """         
-        self._cp_lifecycle.model.build_loss(loss_cls)
-        self._cp_lifecycle.model.build_optimizer(optimizer_cls, optimizer_args, optimizer_fn)
-        self._cp_lifecycle.model.build_epoch_scheduler(epoch_scheduler_cls, epoch_scheduler_args, epoch_scheduler_fn)
-        self._cp_lifecycle.model.build_step_scheduler(step_scheduler_cls, step_scheduler_args, step_scheduler_fn)
-        return True
-
+        if self._setup_called:
+            raise Exception('setup() can only be called once per checkpoint')
+        self._setup_called = True
+        self._cp_lifecycle.setup(*args, **opts)
+        return self
 
     def train(self, 
               train_dataloader: DataLoader, val_dataloader: DataLoader, 
@@ -747,6 +908,17 @@ class CheckpointAPI:
         hist = hist if hist else self._cp_lifecycle.combined_history()
         plot_metrics(hist)
 
+class LearningRateVsLoss:
+    def __init__(self, rates, losses) -> None:
+        self.rates = np.array(rates)
+        self.losses = np.array(losses)
+
+    def plot(self, start=None, end=None):
+        start = np.argmax(self.rates >= start) if start else 0
+        end = np.argmax(self.rates > end) if end else None
+        end = None if end == 0 else end
+        plot_lr_vs_loss(self.rates[start:end], self.losses[start:end])
+
 def plot_metrics(hist):
     x = hist['epoch']
     y = defaultdict(lambda: {})
@@ -767,3 +939,12 @@ def plot_metrics(hist):
         ax.legend(loc='upper left')
         ax.set_xticks(x)
         ax.grid()
+
+def plot_lr_vs_loss(rates, losses):
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.semilogx()
+    ax.plot(rates, losses, "b")
+    ax.hlines(min(losses), min(rates), max(rates), color="k")
+    ax.set_xlabel("Learning rate")
+    ax.set_ylabel("Loss")
+    ax.grid()
