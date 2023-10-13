@@ -1,97 +1,3 @@
-""" 
-The goal of the registry is to ensure that Jupyter notebooks can be run repeatedly without incurring
-the cost of re-training. We should be able to replay the entire notebook, or up to a certain point,
-without spending any time on training - just by loading states from checkpoints. 
-
-When we perform a training process, the model, optimizer, and learning schedules hold states.
-Their state before their training is different than their state after the training.
-This means that there are two behaviors we need to allow:
-- First run: we need the calling code to build all relevant objects in their initial state.
-- Subsequent runs: while the calling code can (and often should) build the objects, we need to load 
-  all object states from the checkpoint so we can continue where we left off. 
-
-This can be achieved with something like the following.
-
-Usage:
-
-# my_namespace is used as the root folder
-import train
-train.set_namespace('my_namespace')
-
-# The model id (model1) is used as the folder where all the model's checkpoints are stored.
-model = Model(id='model1', model=build_model(), description='Model description')
-
-with model.checkpoint(id='1.1', description='First cycle') as c:
-    # In the first run, c is uninitialized
-    # After the first run, c and the model get loaded with all relevant object states
-    
-    # The setup() method is ignored in all runs except the first.
-    # These objects are stored on the model level, and if setup() is not called they are taken from there. 
-    # This allows continuing the training process using a second checkpoint from where we left off. 
-    # It is required to call setup() during the first checkpoint. 
-    c.setup(        
-        loss_cls=torch.nn.CrossEntropyLoss,
-        optimizer_cls=torch.optim.Adam, 
-        optimizer_args=dict(weight_decay=5e-4, lr=0.001),
-        loss_fn_cls=torch.nn.CrossEntropyLoss, 
-        epoch_scheduler_cls=torch.optim.lr_scheduler.StepLR, 
-        epoch_scheduler_args=dict(step_size=40, gamma=0.2)        
-    )
-
-    # When the first run concludes, all states are stored as well as the output hist
-    # After the first run, hist is loaded from the checkpoint
-    hist = c.train(train_dl, test_dl, epochs=160, metrics=[train.metric_accuracy], watch='val_accuracy')
-
-    # Helpful utilities
-    c.plot_metrics(hist)
-
-# Revert the model to any checkpoint
-model.load_checkpoint(id='1.1')
-
-# Create a new model in memory based on all object states of model
-model2 = model.fork(id='model2', description='Going to try something new')
-with model2.checkpoint(id=1) as c:
-    # Here we are overriding just the optimizer. The class and states of the schedulers and loss functions remain 
-    # the same as in model1, but they are distinct objects in memory due to the fork.
-    c.setup(
-        optimizer_cls=torch.optim.SGD, 
-        optimizer_args=dict(weight_decay=5e-4, lr=0.1, momentum=0.9),    
-    )
-    c.train(train_dl, test_dl, epochs=160, metrics=[train.metric_accuracy])
-
-# Delete one checkpoint
-model2.delete_checkpoint(id=1)
-
-# All checkpoints are deleted
-model2.delete()
-
----
-setup() args:
-    Loss factory:
-        loss_cls=torch.nn.CrossEntropyLoss,
-
-    Optimizer factory, option 1:
-        optimizer_cls=torch.optim.Adam
-        optimizer_args=dict(weight_decay=5e-4, lr=0.001)
-
-    Optimizer factory, option 2:
-        optimizer_fn=lambda params: torch.optim.Adam(params, weight_decay=54-4, lr=0.001)
-
-    Epoch scheduler, option 1:
-        epoch_scheduler_cls=torch.optim.lr_scheduler.StepLR
-        epoch_scheduler_args=dict(step_size=40, gamma=0.2)
-
-    Epoch scheduler, option 2:
-        epoch_scheduler_fn=lambda optimizer: torch.optim.lr_scheduler.StepLR(optimizer, step_size=40, gamma=0.2)
-
-    Step scheduler, option 1:
-        step_scheduler_cls=torch.optim.lr_scheduler.StepLR
-        step_scheduler_args=dict(step_size=40, gamma=0.2)
-
-    Step scheduler, option 2:
-        step_scheduler_fn=lambda optimizer: torch.optim.lr_scheduler.StepLR(optimizer, step_size=40, gamma=0.2)
-"""
-
 from contextlib import contextmanager
 from typing import Literal
 import numpy as np
@@ -99,6 +5,8 @@ import humanize
 import torch
 from tempfile import TemporaryDirectory
 import os
+import glob
+import re
 import shutil
 from tqdm.std import tqdm
 from collections import defaultdict, namedtuple
@@ -193,7 +101,10 @@ class SetupManager():
             self.component_recipes['loss'] = SetupLoss(loss_cls)
             self.build_loss()
 
-    def _set_component(self, key, cls=None, args=None, fn=None):
+    def _set_component(self, key, cls=None, args=None, fn=None, clear=False):
+        if clear:
+            self.component_recipes[key] = SetupComponent(None, None, None)
+            return True
         if cls or args or fn:
             self.component_recipes[key] = SetupComponent(cls, args, fn)
             return True
@@ -202,11 +113,11 @@ class SetupManager():
     def setup_optimizer(self, optimizer_cls=None, optimizer_args=None, optimizer_fn=None):
         self._set_component('optimizer', optimizer_cls, optimizer_args, optimizer_fn) and self.build_optimizer()
 
-    def setup_epoch_scheduler(self, epoch_scheduler_cls=None, epoch_scheduler_args=None, epoch_scheduler_fn=None):
-        self._set_component('epoch_scheduler', epoch_scheduler_cls, epoch_scheduler_args, epoch_scheduler_fn) and self.build_scheduler('epoch_scheduler')
+    def setup_epoch_scheduler(self, epoch_scheduler_cls=None, epoch_scheduler_args=None, epoch_scheduler_fn=None, clear_epoch_scheduler=False):
+        self._set_component('epoch_scheduler', epoch_scheduler_cls, epoch_scheduler_args, epoch_scheduler_fn, clear_epoch_scheduler) and self.build_scheduler('epoch_scheduler')
 
-    def setup_step_scheduler(self, step_scheduler_cls=None, step_scheduler_args=None, step_scheduler_fn=None):
-        self._set_component('step_scheduler', step_scheduler_cls, step_scheduler_args, step_scheduler_fn) and self.build_scheduler('step_scheduler')
+    def setup_step_scheduler(self, step_scheduler_cls=None, step_scheduler_args=None, step_scheduler_fn=None, clear_step_scheduler=False):
+        self._set_component('step_scheduler', step_scheduler_cls, step_scheduler_args, step_scheduler_fn, clear_step_scheduler) and self.build_scheduler('step_scheduler')
 
     def build_loss(self):
         if self.component_recipes['loss'].cls:
@@ -227,6 +138,8 @@ class SetupManager():
         elif component.cls or component.args:
             scheduler_args = component.args if component.args else dict()
             setattr(self.model, key, component.cls(self.model.optimizer, **scheduler_args))
+        else:
+            setattr(self.model, key, None)
 
     def build_all(self):
         self.build_loss()
@@ -369,12 +282,12 @@ class Model:
     def setup(self, 
               loss_cls=None, 
               optimizer_cls=None, optimizer_args=None, optimizer_fn=None, 
-              epoch_scheduler_cls=None, epoch_scheduler_args=None, epoch_scheduler_fn=None,
-              step_scheduler_cls=None, step_scheduler_args=None, step_scheduler_fn=None):
+              epoch_scheduler_cls=None, epoch_scheduler_args=None, epoch_scheduler_fn=None, clear_epoch_scheduler=False,
+              step_scheduler_cls=None, step_scheduler_args=None, step_scheduler_fn=None, clear_step_scheduler=False):
         self.setup_manager.setup_loss(loss_cls)
         self.setup_manager.setup_optimizer(optimizer_cls, optimizer_args, optimizer_fn)
-        self.setup_manager.setup_epoch_scheduler(epoch_scheduler_cls, epoch_scheduler_args, epoch_scheduler_fn)
-        self.setup_manager.setup_step_scheduler(step_scheduler_cls, step_scheduler_args, step_scheduler_fn)
+        self.setup_manager.setup_epoch_scheduler(epoch_scheduler_cls, epoch_scheduler_args, epoch_scheduler_fn, clear_epoch_scheduler)
+        self.setup_manager.setup_step_scheduler(step_scheduler_cls, step_scheduler_args, step_scheduler_fn, clear_step_scheduler)
 
     def serialize(self):
         data = {
@@ -392,7 +305,7 @@ class Model:
             data['step_scheduler_state_dict'] = self.step_scheduler.state_dict()
         return data
     
-    def deserialize(self, data):
+    def deserialize(self, data, load_schedulers=True):
         if not self.description:
             self.description = data['model_description']
         self.step = data['step']
@@ -400,24 +313,28 @@ class Model:
         self.model.load_state_dict(data['model_state_dict'])
         if data.get('optimizer_state_dict'):
             self.optimizer.load_state_dict(data['optimizer_state_dict'])
-        if data.get('epoch_scheduler_state_dict'):
+        if load_schedulers and data.get('epoch_scheduler_state_dict'):
             self.epoch_scheduler.load_state_dict(data['epoch_scheduler_state_dict'])
-        if data.get('step_scheduler_state_dict'):
+        if load_schedulers and data.get('step_scheduler_state_dict'):
             self.step_scheduler.load_state_dict(data['step_scheduler_state_dict'])
 
     @contextmanager
     def checkpoint(self, id, description=None):
         cp = self._obtain_checkpoint(id, description)
         self.active_checkpoint = cp
-        yield cp.get_api()
+        yield CheckpointTrainAPI(cp)
 
-    def load_checkpoint(self, id, from_backup=False):
+    def cache(self, id, description=None):
+        cp = self._obtain_checkpoint(id, description)
+        self.active_checkpoint = cp
+        return CheckpointCacheAPI(cp)
+
+    def load_checkpoint(self, id, from_backup=False, load_schedulers=True):
         cp = self._obtain_checkpoint(id)
         self.active_checkpoint = cp
-        self.setup_manager = cp.setup_manager_copy
+        self.setup_manager = cp.setup_manager_copy.clone()
         self.setup_manager.build_all()
-        cp.load(backup=from_backup, logger=print)
-        cp.load_history()
+        cp.load(backup=from_backup, load_schedulers=load_schedulers, logger=print)
 
     def delete_checkpoint(self, id):
         cp = self._remove_checkpoint(id)
@@ -667,20 +584,114 @@ class Model:
         else:
             print(f"Trainable params: {human_fn(trainable)}. Untrainable params: {human_fn(untrainable)}. Buffers: {human_fn(buffers)}.")
 
+class CacheFile:
+    def __init__(self, file_path) -> None:
+        self.file_path = Path(file_path)
+        self.data = None
+        self._load()
+
+    def __repr__(self) -> str:
+        if not self.data:
+            return None.__repr__()
+        if isinstance(self.data, list):
+            return { 'count': len(self.data) }.__repr__()
+        if isinstance(self.data, dict):
+            return {k: True for k in self.data}.__repr__()
+    
+    def get_from_list(self, index=None):
+        data = self.data or []
+        if not isinstance(data, list):
+            raise Exception('get_from_list() can only be called for list caches')
+        
+        if index is not None:
+            if data and index < len(data):
+                return data[index]
+        else:
+            return data
+
+    def get_from_dict(self, key=None):
+        data = self.data or {}
+        if key is not None:
+            return data.get(key)
+        else:
+            return data
+        
+    def set_list_item(self, index, data):
+        if self.data is None:
+            self.data = []
+        elif not isinstance(self.data, list):
+            raise Exception('set_list_item() can only be called for list caches')
+            
+        curr_length = len(self.data)
+        if index < curr_length:
+            self.data[index] = data
+        elif index == curr_length:
+            self.data.append(data)
+        else:
+            raise Exception(f'Cannot set list item at index {index} for list length of {curr_length}')
+        
+    def set_dict_item(self, key, data):
+        if self.data is None:
+            self.data = dict()
+        elif not isinstance(self.data, dict):
+            raise Exception('set_dict_item() can only be called for dict caches')
+        self.data[key] = data
+
+    def remove_dict_item(self, key=None):
+        if self.data is None:
+            return
+        elif not isinstance(self.data, dict):
+            raise Exception('set_dict_item() can only be called for dict caches')
+        if key:
+            del(self.data[key])
+        else:
+            self.data = None
+
+    def _load(self):
+        if not self.file_path.exists():
+            return False
+        self.data = torch.load(self.file_path)
+        return True
+    
+    def save(self):
+        if not self.data:
+            self.delete()
+            return False
+        os.makedirs(self.file_path.parent, exist_ok=True)
+        torch.save(self.data, self.file_path)
+        return True
+
+    def delete(self):
+        if not self.file_path.exists():
+            return False
+        os.remove(self.file_path)
+        return True
 
 class CheckpointLifecycle:
     def __init__(self, model: Model, id, description=None):
         self.model = model
         self.id = id
-        self.norm_id = str(id).zfill(4) if isinstance(id, int) else _ensure_no_space(id)
+        self.norm_id = self._calc_norm_id(id)
         self.description = description
         self.persisted = False
         self.metrics = {}
-        self.histories = []
+        cache_prefix = str(self.model.checkpoint_path() / (self.norm_id + model_checkpoint_sep))
+        self.train_api_cache = CacheFile(cache_prefix + 'train.cache')
+        self.cache_api_cache = CacheFile(cache_prefix + 'cache.cache')
         self.setup_manager_copy = model.setup_manager.clone()
 
+    def _calc_norm_id(self, id):
+        if isinstance(id, int):
+            return str(id).zfill(4) 
+        elif isinstance(id, float):
+            ip = str(math.floor(id)).zfill(4)
+            fp = str(math.floor(id % 1 * 100))
+            return ip + model_checkpoint_sep + fp
+        else:
+            return _ensure_no_space(id)
+
     def __repr__(self):
-        return pprint.pformat({
+        data = {
             'model_id': self.model.id,
             'model_description': self.model.description,
             'checkpoint_id': self.id,
@@ -688,13 +699,12 @@ class CheckpointLifecycle:
             'checkpoint_description': self.description,
             'persisted': self.persisted,
             'metrics': self.metrics,
-            'train_count': len(self.histories),
-            'setup': self.setup_manager_copy
-        }, sort_dicts=False)
+            'setup': self.setup_manager_copy,
+            'train_api_cache': self.train_api_cache,
+            'cache_api_cache': self.cache_api_cache
+        }
+        return pprint.pformat(data, sort_dicts=False)
 
-    def get_api(self) -> 'CheckpointAPI':
-        return CheckpointAPI(self)
-    
     def setup(self, *args, **opts):
         self.model.setup(*args, **opts)
         self.setup_manager_copy = self.model.setup_manager.clone()
@@ -709,8 +719,8 @@ class CheckpointLifecycle:
         }
         return data
 
-    def deserialize(self, data):
-        self.model.deserialize(data)
+    def deserialize(self, data, load_schedulers=True):
+        self.model.deserialize(data, load_schedulers=load_schedulers)
         if not self.description:
             self.description = data['checkpoint_description']
         self.metrics = data['checkpoint_metrics']
@@ -722,11 +732,8 @@ class CheckpointLifecycle:
         version = 'best' if backup else 'last'
         return self.model.checkpoint_path() / f'{self.norm_id + model_checkpoint_sep + version}.pt'
     
-    def hist_path(self) -> Path:
-        return self.model.checkpoint_path() / f'{self.norm_id}.hist'
-
     # The knowledge of whether a backup exists is only present in the calling code. There is no trace for such information in the data stored.
-    def load(self, backup=False, logger=None):
+    def load(self, backup=False, load_schedulers=True, logger=None):
         path = self.checkpoint_path(backup=backup)
 
         if backup and not path.exists():
@@ -740,7 +747,7 @@ class CheckpointLifecycle:
             return False
 
         data = torch.load(path)
-        self.deserialize(data)
+        self.deserialize(data, load_schedulers=load_schedulers)
         self.persisted = True
 
         if logger:
@@ -771,32 +778,11 @@ class CheckpointLifecycle:
             logger(" ".join([x for x in [saved_str, metrics_str] if x]))
 
         return True
-    
-    def load_history(self):
-        hist_path = self.hist_path()
-        if not hist_path.exists():
-            return False
-        self.histories = torch.load(hist_path)
-        return True
-
-    def save_history(self):
-        hist_path = self.hist_path()
-        os.makedirs(hist_path.parent, exist_ok=True)
-        torch.save(self.histories, hist_path)
-        return True
-    
-    def set_history(self, index, hist):
-        if index < len(self.histories):
-            self.histories[index] = dict(hist)
-        elif index == len(self.histories):
-            self.histories.append(dict(hist))
-        else:
-            raise Exception(f'Cannot set history of length {len(self.histories)} at index {index}')
-        
+            
     def combined_history(self):
         padding = 0
         hist_dict = defaultdict(lambda: [None] * padding)
-        for hist in self.histories:
+        for hist in self.train_api_cache.get_from_list():
             for key, values in hist.items():
                 hist_dict[key] += values
             padding += len(hist['epoch'])
@@ -811,14 +797,41 @@ class CheckpointLifecycle:
         if save_path.exists():
             os.remove(save_path)
 
-        hist_path = self.hist_path()
-        if hist_path.exists():
-            os.remove(hist_path)
-
+        self.train_api_cache.delete()
+        self.cache_api_cache.delete()
         self.persisted = False
 
+class CheckpointCacheAPI:
+    def __init__(self, cp_lifecycle: CheckpointLifecycle) -> None:
+        self._cp_lifecycle = cp_lifecycle
+
+    def __repr__(self) -> str:
+        return self._cp_lifecycle.__repr__()
     
-class CheckpointAPI:
+    def _cache(self, key, calculate_fn: callable):
+        data = self._cp_lifecycle.cache_api_cache.get_from_dict(key)
+        if data:
+            return data        
+        res = calculate_fn()
+        self._cp_lifecycle.cache_api_cache.set_dict_item(key, res)
+        self._cp_lifecycle.cache_api_cache.save()
+        return res
+        
+    def evaluate(self, *args, **opts):
+        return self._cache('evaluate', lambda: self._cp_lifecycle.model.evaluate(*args, **opts))
+
+    def find_lr(self, *args, **opts):
+        return self._cache('find_lr', lambda: self._cp_lifecycle.model.find_lr(*args, **opts))
+    
+    def delete(self, key=None):
+        if key:
+            self._cp_lifecycle.cache_api_cache.remove_dict_item(key)
+            self._cp_lifecycle.cache_api_cache.save()
+        else:
+            self._cp_lifecycle.cache_api_cache.remove_dict_item()
+            self._cp_lifecycle.cache_api_cache.delete()
+
+class CheckpointTrainAPI:
     def __init__(self, cp_lifecycle: CheckpointLifecycle):
         self._cp_lifecycle = cp_lifecycle
         self._setup_called = False
@@ -866,12 +879,11 @@ class CheckpointAPI:
         
         if self._train_method_call_count == 0:
             self._cp_lifecycle.load()
-            self._cp_lifecycle.load_history()
 
         self._train_method_call_count += 1
 
-        if self._train_method_call_count <= len(self._cp_lifecycle.histories):
-            hist = self._cp_lifecycle.histories[self._train_method_call_count - 1]
+        hist = self._cp_lifecycle.train_api_cache.get_from_list(self._train_method_call_count - 1)
+        if hist:
             for msg in hist['log']:
                 print(msg)
             return hist
@@ -882,11 +894,11 @@ class CheckpointAPI:
             self._cp_lifecycle.save(*args, **opts)
 
         def save_hist_fn(hist):
-            self._cp_lifecycle.set_history(self._train_method_call_count - 1, hist)
-            self._cp_lifecycle.save_history()
+            self._cp_lifecycle.train_api_cache.set_list_item(self._train_method_call_count - 1, dict(hist))
+            self._cp_lifecycle.train_api_cache.save()
 
         def load_best_fn(logger=None):
-            self._cp_lifecycle.load(backup=False, logger=logger)
+            self._cp_lifecycle.load(backup=False, load_schedulers=False, logger=logger)
 
         return self._cp_lifecycle.model.train(train_dataloader=train_dataloader, 
                                               val_dataloader=val_dataloader, 
@@ -900,9 +912,6 @@ class CheckpointAPI:
                                               save_checkpoint_fn=save_checkpoint_fn,
                                               save_hist_fn=save_hist_fn,
                                               load_best_fn=load_best_fn)
-
-    def evaluate(self, *args, **opts):
-        return self._cp_lifecycle.model.evaluate(*args, **opts)
     
     def plot_metrics(self, hist=None):
         hist = hist if hist else self._cp_lifecycle.combined_history()
