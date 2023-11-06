@@ -237,6 +237,22 @@ class MetricsManager:
             self.best_watched_metric_epoch = self.global_epoch_start + local_epoch
             self.best_watched_metric = self.mean_metrics[f'val_{self.watch}']
 
+class WarmUpLR(torch.optim.lr_scheduler.LRScheduler):
+    """warmup_training learning rate scheduler
+    Args:
+        optimizer: optimzier(e.g. SGD)
+        total_iters: totoal_iters of warmup phase
+    """
+    def __init__(self, optimizer, total_iters, last_epoch=-1):
+        self.total_iters = total_iters
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        """we will use the first m batches, and set the learning
+        rate to base_lr * m / total_iters
+        """
+        return [base_lr * self.last_epoch / (self.total_iters + 1e-8) for base_lr in self.base_lrs]
+
 class Model:
     def __init__(self, id, model: torch.nn.Module, description=None):
         _ensure_namespace()
@@ -406,7 +422,7 @@ class Model:
               load_best: bool = True,
               epochs: int = 10, 
               patience: int = 0, 
-              warmup: int = 1, 
+              warmup: int = 0, 
               metrics: list[callable] = [],
               tensorboard_dir: str = None,
               save_checkpoint_fn: callable = None,
@@ -430,9 +446,8 @@ class Model:
         steps_per_epoch = len(train_dataloader)
         warmup_scheduler = None
 
-        # TODO: change this to an actual WarmUp scheduler
-        if warmup > 0 and warmup > global_epoch_start:
-            warmup_scheduler = torch.optim.lr_scheduler.LinearLR(self.optimizer, start_factor=1e-3, total_iters=steps_per_epoch * warmup)
+        if warmup > 0:
+            warmup_scheduler = WarmUpLR(self.optimizer, total_iters=steps_per_epoch * warmup)
 
         try: 
             for local_epoch in range(epochs):
